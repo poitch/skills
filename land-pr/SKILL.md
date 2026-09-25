@@ -1,15 +1,49 @@
 ---
 name: land-pr
-description: Take a GitHub PR through the full landing process — mark ready, run review (CodeRabbit, falling back to Durian only when CodeRabbit is throttled), monitor until the review completes, address the comments, and squash-merge.
+description: Take a GitHub PR through the full landing process — mark ready, run review (CodeRabbit, falling back to a configurable review bot only when CodeRabbit is throttled), monitor until the review completes, address the comments, and squash-merge.
 disable-model-invocation: true
 argument-hint: "[PR number, optional - auto-detects current branch PR]"
-allowed-tools: Bash(gh *), Bash(git *), Read, Edit, Glob, Grep
+allowed-tools: Bash(gh *), Bash(git *), Bash(printenv *), Read, Edit, Glob, Grep
 ---
 
 # Land a PR
 
 Take a pull request from draft to merged: mark it ready, get it reviewed, address
 the review, and merge it. Run the steps in order; do not skip ahead.
+
+## Configuration: the fallback reviewer
+
+CodeRabbit is the primary reviewer. When it is throttled, this skill can hand the
+review to a second bot — but which bot, and how to summon it, is per-repository,
+so it comes from environment variables rather than being written in here. Set
+them in the `env` block of Claude Code's settings: the repository's committed
+`.claude/settings.json` (travels with the repo — best when the bot is specific to
+it) or your `~/.claude/settings.json` (applies everywhere).
+
+| Variable | Required | Meaning |
+|---|---|---|
+| `LAND_PR_FALLBACK_COMMENT` | to enable the fallback | The exact comment that summons the bot, e.g. `@review-bot review` |
+| `LAND_PR_FALLBACK_LOGIN` | no | Regex matching the bot's GitHub login. Default: the handle from the comment's leading `@mention` (`review-bot`) |
+| `LAND_PR_FALLBACK_DONE` | no | Regex a comment from the bot matches once its review is finished, e.g. `Status.*REVIEWED`. Default: the bot has submitted a PR review, or posted a comment after the summon |
+
+```json
+{
+  "env": {
+    "LAND_PR_FALLBACK_COMMENT": "@review-bot review",
+    "LAND_PR_FALLBACK_DONE": "Status.*REVIEWED"
+  }
+}
+```
+
+Read them at the start (an unset variable prints nothing):
+
+```
+printenv LAND_PR_FALLBACK_COMMENT LAND_PR_FALLBACK_LOGIN LAND_PR_FALLBACK_DONE
+```
+
+With no `LAND_PR_FALLBACK_COMMENT`, there is **no fallback**: if CodeRabbit is
+throttled, tell the user, say when it should be available again (its cooldown
+runs ~30 min), and stop — do not invent a reviewer to ping.
 
 ## Step 1: Identify the PR and mark it ready
 
@@ -29,10 +63,10 @@ gh pr ready {number}
 
 If it's already ready, that's fine — continue.
 
-## Step 2: Trigger review — CodeRabbit first, Durian only on throttle
+## Step 2: Trigger review — CodeRabbit first, the fallback only on throttle
 
-Marking the PR ready makes **CodeRabbit** auto-review. **Do not ping Durian by
-default** — Durian is the fallback for when CodeRabbit is rate-limited.
+Marking the PR ready makes **CodeRabbit** auto-review. **Do not summon the
+fallback reviewer by default** — it is only for when CodeRabbit is rate-limited.
 
 Give CodeRabbit ~30–60s, then check whether it's throttled:
 
@@ -49,21 +83,23 @@ review posted.
 **IMPORTANT — the "Draft detected" race is NOT a skip to act on.** If CodeRabbit
 posts *"Review skipped — Draft detected"* right after you ran `gh pr ready`, that
 just means its webhook fired against the pre-ready state — it hasn't processed the
-`ready` event yet. Do **not** fall back to Durian on this. Wait another ~30–60s and
-re-check the comments: CodeRabbit reprocesses the `ready` event on its own and
-posts *"Currently processing… review in progress"*, then a real review. Only treat
-it as inconclusive if, after that wait, it is genuinely rate-limited (*"Review
-limit reached"*) or the comment still says *"Review skipped"* for a non-draft reason
+`ready` event yet. Do **not** fall back on this. Wait another ~30–60s and re-check
+the comments: CodeRabbit reprocesses the `ready` event on its own and posts
+*"Currently processing… review in progress"*, then a real review. Only treat it as
+inconclusive if, after that wait, it is genuinely rate-limited (*"Review limit
+reached"*) or the comment still says *"Review skipped"* for a non-draft reason
 (e.g. path filters, `.coderabbit.yaml`). Never manually `@coderabbitai review` to
-un-stick it — that burns its (throttled) quota; wait, or fall back to Durian.
+un-stick it — that burns its (throttled) quota; wait, or fall back.
 
-- **Throttled / genuinely skipped** → fall back to Durian with an **exact bare
-  mention** (no other prose):
+- **Throttled / genuinely skipped, and `LAND_PR_FALLBACK_COMMENT` is set** → post it
+  **exactly**, with no other prose, and note the time you posted it:
   ```
-  gh pr comment {number} --body "@durian-review review"
+  gh pr comment {number} --body "$LAND_PR_FALLBACK_COMMENT"
   ```
+- **Throttled / genuinely skipped, and no fallback is configured** → tell the user
+  CodeRabbit is throttled and when to retry, and stop (see Configuration).
 - **Reviewing (incl. after a draft-race re-check)** → let CodeRabbit run; do **not**
-  also ping Durian (avoid a double review).
+  also summon the fallback (avoid a double review).
 
 ## Step 3: Monitor the reviewer until it's done
 
@@ -73,11 +109,18 @@ reviewer finishes. Reviewers do **not** auto-re-review on later pushes.
 - **CodeRabbit done:** the `CodeRabbit` / `CodeRabbit / Review` status check reaches a
   conclusion and it has posted its review (a summary comment plus any inline file
   comments).
-- **Durian done:** it posts a comment containing `Status: REVIEWED` and a findings
-  count (e.g. `Findings … N inline`). Poll for that:
+- **Fallback done:** match the bot by `LAND_PR_FALLBACK_LOGIN` (or the handle taken
+  from the summon comment). With `LAND_PR_FALLBACK_DONE` set, it is done once one of
+  its comments matches that pattern:
   ```
   gh api repos/{owner}/{repo}/issues/{number}/comments \
-    --jq '[.[]|select(.user.login|test("durian";"i"))|select(.body|test("Status.*REVIEWED";"i"))]|length'
+    --jq '[.[]|select(.user.login|test("<login>";"i"))|select(.body|test("<done>";"i"))]|length'
+  ```
+  Without it, it is done once the bot has submitted a PR review, or posted a comment
+  after your summon:
+  ```
+  gh api repos/{owner}/{repo}/pulls/{number}/reviews \
+    --jq '[.[]|select(.user.login|test("<login>";"i"))]|length'
   ```
 
 ## Step 4: Address the review comments
@@ -127,7 +170,7 @@ Then, for each **unresolved** thread (skip resolved threads and reply comments w
    ```
 
 **Reply to each comment individually — NOT with one summary comment at the top of the
-PR.** Both CodeRabbit and Durian *learn* from the per-comment replies (accept/reject
+PR.** Review bots *learn* from the per-comment replies (accept/reject
 signal on each finding), so a single top-level summary teaches them nothing. One reply
 per thread, on the thread.
 

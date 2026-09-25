@@ -12,7 +12,7 @@ A collection of reusable skills for AI coding agents that automate common Git an
 | `/pr-comments` | Fetch unresolved PR review comments and address each one with code changes |
 | `/wait-and-fix` | Wait for Copilot code review to finish, then auto-fix all review comments |
 | `/wait-merge-pr` | Wait for all PR checks to pass, then squash-merge and clean up |
-| `/land-pr` | Take a PR from draft to merged: mark ready, get it reviewed (CodeRabbit, falling back to Durian when CodeRabbit is throttled), address the review, and squash-merge |
+| `/land-pr` | Take a PR from draft to merged: mark ready, get it reviewed (CodeRabbit, falling back to a configurable review bot when CodeRabbit is throttled), address the review, and squash-merge |
 
 ## Installation
 
@@ -30,8 +30,11 @@ Claude Code, `~/.claude/skills/`), and records the source in
 
 Each skill is a self-contained directory with a `SKILL.md` that the agent follows step-by-step. No additional dependencies required beyond `git` and `gh` (GitHub CLI).
 
-`/land-pr` assumes a repository reviewed by CodeRabbit, with a Durian review bot
-(`@durian-review`) as the fallback reviewer when CodeRabbit is rate-limited.
+`/land-pr` uses CodeRabbit as the reviewer. An optional fallback bot for when
+CodeRabbit is rate-limited is configured through environment variables in the `env`
+block of Claude Code's `settings.json` — see the Configuration section of
+[`land-pr/SKILL.md`](land-pr/SKILL.md). Without one, `/land-pr` stops and says when
+CodeRabbit will be available again.
 
 ## How It Works
 
