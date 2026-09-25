@@ -11,18 +11,30 @@ A collection of reusable skills for AI coding agents that automate common Git an
 | `/merge-pr` | Squash-merge a PR, delete the branch, and switch back to main |
 | `/pr-comments` | Fetch unresolved PR review comments and address each one with code changes |
 | `/wait-and-fix` | Wait for Copilot code review to finish, then auto-fix all review comments |
+| `/wait-merge-pr` | Wait for all PR checks to pass, then squash-merge and clean up |
+| `/land-pr` | Take a PR from draft to merged: mark ready, get it reviewed (CodeRabbit, falling back to a configurable review bot when CodeRabbit is throttled), address the review, and squash-merge |
 
 ## Installation
 
-Add this repository as a skill source in your agent configuration. For Claude Code, add it to your `.claude/settings.json`:
+Install with the [`skills`](https://github.com/vercel-labs/skills) CLI:
 
-```json
-{
-  "skills": ["github:poitch/skills"]
-}
+```sh
+npx skills add poitch/skills
 ```
 
+Choose Claude Code (and any other agents you use) when prompted, and install
+globally to make the skills available in every project. The CLI copies each skill
+into `~/.agents/skills/`, symlinks it into each agent's skills directory (for
+Claude Code, `~/.claude/skills/`), and records the source in
+`~/.agents/.skill-lock.json` so they can be updated later.
+
 Each skill is a self-contained directory with a `SKILL.md` that the agent follows step-by-step. No additional dependencies required beyond `git` and `gh` (GitHub CLI).
+
+`/land-pr` uses CodeRabbit as the reviewer. An optional fallback bot for when
+CodeRabbit is rate-limited is configured through environment variables in the `env`
+block of Claude Code's `settings.json` — see the Configuration section of
+[`land-pr/SKILL.md`](land-pr/SKILL.md). Without one, `/land-pr` stops and says when
+CodeRabbit will be available again.
 
 ## How It Works
 

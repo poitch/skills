@@ -10,15 +10,31 @@ allowed-tools: Bash(gh *), Read, Edit, Glob, Grep
 
 Pull all review comments from the current GitHub pull request and address each one by making the necessary code changes.
 
-## Step 1: Identify the PR
+## Step 1: Identify the PR and check out its branch
 
 If the user provided a PR number as `$ARGUMENTS`, use that. Otherwise, detect the PR for the current branch:
 
 ```
-gh pr view --json number,title,url,headRefName
+gh pr view [number] --json number,title,url,headRefName,state
 ```
 
-If no PR is found, inform the user and stop.
+If no PR is found (or it is already merged/closed), inform the user and stop.
+
+**Then check out the PR's branch before editing anything.** When a PR number is
+passed, you are often on a different branch (e.g. `main`), so edits would
+otherwise land on the wrong branch — the changes never reach the PR and may
+pollute `main`'s working tree. Switch to the PR's head branch first:
+
+```
+git fetch origin <headRefName>
+git checkout <headRefName>
+git pull --ff-only    # if it tracks a remote
+```
+
+If the working tree has uncommitted changes that block the checkout, STOP and
+tell the user — do not stash, discard, or force-switch. Only start reading and
+editing files once `git branch --show-current` confirms you are on
+`<headRefName>`.
 
 ## Step 2: Fetch all review comments
 

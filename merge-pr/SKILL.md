@@ -22,21 +22,31 @@ If no PR is found or the PR is already merged/closed, inform the user and stop.
 
 ## Step 2: Merge the PR
 
-Squash-merge the PR and delete the remote branch in one step:
+Squash-merge the PR with auto-merge enabled and delete the remote branch in one step:
 
 ```
-gh pr merge {number} --squash --delete-branch
+gh pr merge {number} --squash --delete-branch --auto
 ```
 
-If the merge fails (e.g. due to merge conflicts or failing checks), inform the user and stop.
+`--auto` queues the merge to fire as soon as required checks go green and branch protection is satisfied. If checks are already green, GitHub merges immediately. This is the right default — it works regardless of whether checks are pending or already passing, and it doesn't require waiting on CI before invoking the skill.
 
-## Step 3: Switch to main
+If the merge fails (e.g. due to merge conflicts, an unmergeable state, or auto-merge being disabled at the repo level), inform the user and stop.
+
+## Step 3: Confirm
+
+If the merge happened immediately, GitHub returns success and `gh pr view --json state` will show `MERGED`. If auto-merge queued the merge, `gh pr view --json autoMergeRequest,state` will show the queue entry and `state: OPEN`.
+
+If the PR is already merged (state `MERGED`), proceed to step 4. Otherwise, tell the user the merge is queued and stop here — the local cleanup steps below assume the merge actually happened so we can fast-forward main, and we don't want to leave them on a stale main while their PR is still pending.
+
+## Step 4: Switch to main
+
+Only run this when the PR has already merged:
 
 ```
 git checkout main && git pull
 ```
 
-## Step 4: Clean up local branch
+## Step 5: Clean up local branch
 
 If the local branch still exists (it may already have been removed by `--delete-branch`), delete it:
 
@@ -46,6 +56,6 @@ git branch -d {branch_name}
 
 Ignore errors if the branch was already deleted.
 
-## Step 5: Confirm
+## Step 6: Confirm
 
 Let the user know the PR was merged, the branch is cleaned up, and they are on main.
