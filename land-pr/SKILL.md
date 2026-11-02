@@ -24,7 +24,7 @@ it) or your `~/.claude/settings.json` (applies everywhere).
 |---|---|---|
 | `LAND_PR_FALLBACK_COMMENT` | to enable the fallback | The exact comment that summons the bot, e.g. `@review-bot review` |
 | `LAND_PR_FALLBACK_LOGIN` | no | Regex matching the bot's GitHub login. Default: the handle from the comment's leading `@mention` (`review-bot`) |
-| `LAND_PR_FALLBACK_DONE` | no | Regex a comment from the bot matches once its review is finished, e.g. `Status.*REVIEWED`. Default: the bot has submitted a PR review, or posted a comment after the summon |
+| `LAND_PR_FALLBACK_DONE` | no | Regex a comment from the bot matches once its review is finished, e.g. `Status.*REVIEWED`; that comment must also be about the current head (Step 3). Default: the bot has submitted a PR review on the head, or posted a comment after the summon |
 
 ```json
 {
@@ -42,8 +42,38 @@ printenv LAND_PR_FALLBACK_COMMENT LAND_PR_FALLBACK_LOGIN LAND_PR_FALLBACK_DONE
 ```
 
 With no `LAND_PR_FALLBACK_COMMENT`, there is **no fallback**: if CodeRabbit is
-throttled, tell the user, say when it should be available again (its cooldown
-runs ~30 min), and stop — do not invent a reviewer to ping.
+throttled, tell the user and stop — do not invent a reviewer to ping. Say that it
+won't come back to this head by itself (see Step 2): it reviews again on the next
+push, or when the user asks it to.
+
+## CodeRabbit's result on the head
+
+Steps 2, 3 and 5 all ask the same question: what has CodeRabbit concluded about
+the PR's **current head commit**? Depending on how it is installed, CodeRabbit
+answers on that commit either as a **commit status** or as a **check run** — a
+repository can have one and never the other, so read both:
+
+```
+HEAD=$(gh pr view {number} --json headRefOid --jq .headRefOid)
+gh api repos/{owner}/{repo}/commits/$HEAD/status \
+  --jq '.statuses[]|select(.context|test("CodeRabbit";"i"))|"\(.state) \(.description)"'
+gh api repos/{owner}/{repo}/commits/$HEAD/check-runs \
+  --jq '[.check_runs[]|select(.name|test("coderabbit";"i"))]|sort_by(.id)|last
+        |"\(.status) \(.conclusion) \(.output.summary // "" | split("\n")[0])"'
+```
+
+The status's description, or the latest check run's summary (a commit can have
+several runs — the draft-time one and later ones; the highest `id` is the latest),
+says one of:
+
+- ***Review completed*** — CodeRabbit reviewed this head.
+- ***Review in progress*** — it started; wait.
+- ***Review skipped*** — usually the draft-time result (see Step 2), not a verdict.
+- ***Rate limited*** — throttled on this head (see Step 2).
+
+Nothing at all on the head means CodeRabbit hasn't processed it yet. Never read
+this from the PR's comments, its review objects, or `gh pr checks` — Step 3 says
+why each one misleads.
 
 ## Step 1: Identify the PR and mark it ready
 
@@ -68,17 +98,19 @@ If it's already ready, that's fine — continue.
 Marking the PR ready makes **CodeRabbit** auto-review. **Do not summon the
 fallback reviewer by default** — it is only for when CodeRabbit is rate-limited.
 
-Give CodeRabbit ~30–60s, then check whether it's throttled:
+Give CodeRabbit ~30–60s, then read its result on the head (see *CodeRabbit's result
+on the head*). It is **throttled** when that result says *Rate limited*.
 
-```
-gh api repos/{owner}/{repo}/issues/{number}/comments \
-  --jq '.[] | select(.user.login|test("coderabbit";"i")) | .body' | tail -3
-```
+Don't judge throttling from CodeRabbit's comments. It edits one summary comment in
+place and leaves older ones behind, so a *"rate limit"* or *"Review limit reached"*
+comment can be about an earlier push. The reverse happens too: a fresh push can be
+throttled while the latest comment still shows an earlier review.
 
-CodeRabbit is **throttled** if its latest comment says something like *"rate limit"*,
-*"Review limit reached"*, or *"try again in N minutes"* (its cooldown runs ~30 min).
-Also inconclusive: the `CodeRabbit` status check goes `SKIPPED`/`FAILURE` with no
-review posted.
+**A throttled head is never reviewed later on its own.** Once CodeRabbit marks the
+head *Rate limited*, it does not come back to it when its cooldown ends. It
+reviews again only on a new push, or when someone asks it to, which this skill
+never does (see below). So waiting out the cooldown achieves nothing. Fall back
+now (below), and don't apply the long wait for the draft race.
 
 **IMPORTANT — the "Draft detected" race is NOT a skip to act on.** If CodeRabbit
 posts *"Review skipped — Draft detected"* (or *"Draft PR not reviewed"*) right after
@@ -93,11 +125,12 @@ will expire while the review is still coming and make a perfectly healthy CodeRa
 look stuck. Wait at least ~60 minutes before concluding anything, and prefer a
 long-running watcher over a bounded poll loop.
 
-Only treat it as inconclusive if, after that wait, it is genuinely rate-limited
-(*"Review limit reached"*) or the comment still says *"Review skipped"* for a
-non-draft reason (e.g. path filters, `.coderabbit.yaml`). Never manually
-`@coderabbitai review` to un-stick it — that burns its (throttled) quota; wait, or
-fall back.
+While you wait, a later run on the head replaces the draft-time *Review skipped*
+result: the latest one is what counts. Only treat it as inconclusive if the head
+turns *Rate limited* (act on that at once, as above), or if, after that wait, the
+latest result is still *Review skipped* for a non-draft reason (e.g. path filters,
+`.coderabbit.yaml`). Never manually `@coderabbitai review` to un-stick it — that
+burns its (throttled) quota; fall back instead.
 
 - **Throttled / genuinely skipped, and `LAND_PR_FALLBACK_COMMENT` is set** → post it
   **exactly**, with no other prose, and note the time you posted it:
@@ -111,19 +144,21 @@ fall back.
   stale the moment it is printed, so a loop that exits "no review yet" is evidence
   about the past, not the present.
 
-  Re-read the state **immediately** before the summon and abort if a review has
-  landed in the meantime:
-  ```
-  gh api repos/{owner}/{repo}/pulls/{number}/reviews \
-    --jq '[.[]|select(.user.login|test("coderabbit";"i"))]|length'
-  gh api repos/{owner}/{repo}/pulls/{number}/comments --jq 'length'
-  ```
-  Non-zero on either → CodeRabbit reviewed; do **not** summon the fallback. This
-  actually happened: a watcher's last poll missed the review by seconds, the summon
-  went out **15 seconds after** CodeRabbit posted, and the money was spent for
-  nothing. The check costs one API call; skipping it costs the user.
+  **Immediately** before the summon, re-read CodeRabbit's result on the head (see
+  *CodeRabbit's result on the head*). Abort if it now says *Review completed* or
+  *Review in progress*: CodeRabbit got to this head after all, so do **not** summon
+  the fallback. This actually happened: a watcher's last poll missed the review by
+  seconds, the summon went out **15 seconds after** CodeRabbit posted, and the money
+  was spent for nothing. The check costs one API call; skipping it costs the user.
+
+  Anchor that check on the head's result, not on counts of reviews or review
+  comments on the PR. Those include every earlier push's review, and CodeRabbit's
+  replies on review threads file review objects of their own (state `COMMENTED`).
+  On any PR past its first round, the counts are non-zero whether or not this head
+  was reviewed, so a guard built on them blocks every summon.
 - **Throttled / genuinely skipped, and no fallback is configured** → tell the user
-  CodeRabbit is throttled and when to retry, and stop (see Configuration).
+  CodeRabbit is throttled on this head and won't return to it by itself (only a new
+  push, or the user asking, starts another review), and stop (see Configuration).
 - **Reviewing (incl. after a draft-race re-check)** → let CodeRabbit run; do **not**
   also summon the fallback (avoid a double review).
 
@@ -142,42 +177,50 @@ configured fallback may behave differently — it reviews a specific head SHA, s
 findings can silently predate your latest push; check the head it reports.
 
 - **CodeRabbit done:** CodeRabbit has **completed a review of the current head
-  commit** — not of an earlier one, and not merely started one. Anchor every check on
-  the head SHA, and require it to say *completed*:
-  ```
-  HEAD=$(gh pr view {number} --json headRefOid --jq .headRefOid)
-  gh api repos/{owner}/{repo}/commits/$HEAD/status \
-    --jq '.statuses[]|select(.context|test("CodeRabbit";"i"))|"\(.state) \(.description)"'
-  ```
-  Done means `success` **and** a description containing *"Review completed"*. Then read
-  its findings from the review and inline comments whose `commit_id` is `$HEAD`.
+  commit** — not of an earlier one, and not merely started one. Done means its result
+  on the head (see *CodeRabbit's result on the head*) says *Review completed*. Then
+  read its findings from the review and inline comments whose `commit_id` is `$HEAD`.
+  If the head turns *Rate limited* while you wait, it won't be reviewed: go back to
+  Step 2's fallback instead of waiting on.
 
   **Do not accept any of these as "done"** — each one has been mistaken for it:
   - **The PR-level check** (`gh pr checks`). It aggregates across pushes, so it can
     show *"Review completed"* for a commit that is no longer the head.
-  - **A `success` status whose description is "Review skipped".** Pushing while the PR
-    is a draft attaches a *skipped* status to that commit — `state` is `success`, so a
-    check on state alone reads it as a finished review of code nobody reviewed.
+  - **A `success` result that says "Review skipped".** Pushing while the PR is a
+    draft attaches a *skipped* result to that commit, and its state is `success` (a
+    check run's conclusion is too). A check on state alone reads it as a finished
+    review of code nobody reviewed.
   - **A review object on the head commit.** CodeRabbit files a placeholder review
-    (state `COMMENTED`, empty body) within seconds of starting, while the head's status
-    still reads *"Review in progress"*. Its presence on the right commit proves only
-    that a review began.
+    (state `COMMENTED`, empty body) within seconds of starting, while the head's
+    result still reads *"Review in progress"*. Its replies on review threads file
+    review objects too. A review object on the right commit proves only that
+    CodeRabbit said something there.
+  - **No commit status at all.** Where CodeRabbit reports as a check run, the head
+    never gets a status, so a watcher that reads only statuses waits forever and
+    makes a finished review look stuck.
 
-  Each of these fooled a watcher on the same PR in one afternoon. The head commit's
-  status description is the only signal that distinguishes skipped, in progress and
-  completed.
+  Each of these fooled a watcher. The head's result (its status description, or its
+  latest check run's summary) is the only signal that distinguishes skipped, in
+  progress, rate limited and completed.
 - **Fallback done:** match the bot by `LAND_PR_FALLBACK_LOGIN` (or the handle taken
-  from the summon comment). With `LAND_PR_FALLBACK_DONE` set, it is done once one of
-  its comments matches that pattern:
+  from the summon comment). The bot's review must be **of the current head**, as with
+  CodeRabbit. A PR summoned on more than once still carries the earlier run's "done"
+  comment, so a pattern match alone finishes the wait before the new review has
+  begun. With `LAND_PR_FALLBACK_DONE` set, it is done once the bot's latest comment
+  matches that pattern **and** names the head. Bots that edit one status comment in
+  place put the commit they reviewed in it, usually as a short SHA:
   ```
+  HEAD=$(gh pr view {number} --json headRefOid --jq .headRefOid)
   gh api repos/{owner}/{repo}/issues/{number}/comments \
-    --jq '[.[]|select(.user.login|test("<login>";"i"))|select(.body|test("<done>";"i"))]|length'
+    --jq '[.[]|select(.user.login|test("<login>";"i"))]|last|.body // ""' \
+    | grep -iE '<done>' | grep -q "$(echo "$HEAD" | cut -c1-7)" && echo done
   ```
-  Without it, it is done once the bot has submitted a PR review, or posted a comment
-  after your summon:
+  If the bot's comment never names a commit, require one updated after your summon
+  (its `updated_at`) instead. Without `LAND_PR_FALLBACK_DONE`, it is done once the bot
+  has submitted a PR review on the head, or posted a comment after your summon:
   ```
   gh api repos/{owner}/{repo}/pulls/{number}/reviews \
-    --jq '[.[]|select(.user.login|test("<login>";"i"))]|length'
+    --jq "[.[]|select(.user.login|test(\"<login>\";\"i\"))|select(.commit_id==\"$HEAD\")]|length"
   ```
 
 ## Step 4: Address the review comments
@@ -247,22 +290,21 @@ already-merged PR. This nearly shipped a real bug: auto-merge was armed while
 CodeRabbit's second pass was still running, and that pass found a correctness defect
 in the fixes — it only survived because the merge happened not to fire first.
 
-Check, and wait if anything is still going:
+Check, and wait if anything is still going. Read CodeRabbit's result on the head (see
+*CodeRabbit's result on the head*), and the review threads:
 
 ```
-HEAD=$(gh pr view {number} --json headRefOid --jq .headRefOid)
-gh api repos/{owner}/{repo}/commits/$HEAD/status \
-  --jq '.statuses[]|select(.context|test("CodeRabbit";"i"))|"\(.state) \(.description)"'
 gh api graphql -f query='
 { repository(owner: "{owner}", name: "{repo}") {
     pullRequest(number: {number}) {
       reviewThreads(first: 50) { nodes { isResolved } } } } }'
 ```
 
-Arm it only once the head commit's CodeRabbit status reads **"Review completed"** (see
-Step 3 for why neither `gh pr checks` nor a review object on the head is enough) and
-you have addressed what it found. If you armed it and a review is still running, disarm rather
-than race it:
+Arm it only once the head's CodeRabbit result reads **"Review completed"** (see Step 3
+for why neither `gh pr checks` nor a review object on the head is enough) — or, when
+CodeRabbit was rate limited on the head, once the fallback has finished reviewing it —
+and you have addressed what it found. If you armed it and a review is still running,
+disarm rather than race it:
 
 ```
 gh pr merge {number} --disable-auto
